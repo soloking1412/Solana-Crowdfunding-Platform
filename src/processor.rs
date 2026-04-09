@@ -8,7 +8,7 @@ use solana_program::{
     program_error::ProgramError,
     pubkey::Pubkey,
     rent::Rent,
-    system_instruction,
+    system_instruction, system_program,
     sysvar::Sysvar,
 };
 
@@ -53,6 +53,10 @@ impl Processor {
 
         if !creator.is_signer {
             return Err(ProgramError::MissingRequiredSignature);
+        }
+
+        if system_program.key != &system_program::id() {
+            return Err(ProgramError::IncorrectProgramId);
         }
 
         let clock = Clock::get()?;
@@ -109,6 +113,14 @@ impl Processor {
             return Err(ProgramError::MissingRequiredSignature);
         }
 
+        if system_program.key != &system_program::id() {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        if campaign_account.owner != program_id {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
         let (expected_vault, _vault_bump) =
             Pubkey::find_program_address(&[b"vault", campaign_account.key.as_ref()], program_id);
         if expected_vault != *vault_pda.key {
@@ -127,31 +139,64 @@ impl Processor {
             return Err(ProgramError::InvalidAccountData);
         }
 
+        let mut campaign = Campaign::try_from_slice(&campaign_account.data.borrow())?;
+
+        let clock = Clock::get()?;
+        if clock.unix_timestamp >= campaign.deadline {
+            return Err(CrowdfundingError::CampaignEnded.into());
+        }
+
         invoke(
             &system_instruction::transfer(contributor.key, vault_pda.key, amount),
             &[contributor.clone(), vault_pda.clone(), system_program.clone()],
         )?;
 
+        let seeds: &[&[u8]] = &[
+            b"contribution",
+            campaign_account.key.as_ref(),
+            contributor.key.as_ref(),
+            &[contribution_bump],
+        ];
+
         if contribution_pda.data_is_empty() {
             let rent = Rent::get()?;
-            let contribution_lamports = rent.minimum_balance(Contribution::LEN);
+            let required_lamports = rent.minimum_balance(Contribution::LEN);
+            let existing_lamports = contribution_pda.lamports();
 
-            invoke_signed(
-                &system_instruction::create_account(
-                    contributor.key,
-                    contribution_pda.key,
-                    contribution_lamports,
-                    Contribution::LEN as u64,
-                    program_id,
-                ),
-                &[contributor.clone(), contribution_pda.clone(), system_program.clone()],
-                &[&[
-                    b"contribution",
-                    campaign_account.key.as_ref(),
-                    contributor.key.as_ref(),
-                    &[contribution_bump],
-                ]],
-            )?;
+            if existing_lamports == 0 {
+                invoke_signed(
+                    &system_instruction::create_account(
+                        contributor.key,
+                        contribution_pda.key,
+                        required_lamports,
+                        Contribution::LEN as u64,
+                        program_id,
+                    ),
+                    &[contributor.clone(), contribution_pda.clone(), system_program.clone()],
+                    &[seeds],
+                )?;
+            } else {
+                if existing_lamports < required_lamports {
+                    invoke(
+                        &system_instruction::transfer(
+                            contributor.key,
+                            contribution_pda.key,
+                            required_lamports - existing_lamports,
+                        ),
+                        &[contributor.clone(), contribution_pda.clone(), system_program.clone()],
+                    )?;
+                }
+                invoke_signed(
+                    &system_instruction::allocate(contribution_pda.key, Contribution::LEN as u64),
+                    &[contribution_pda.clone(), system_program.clone()],
+                    &[seeds],
+                )?;
+                invoke_signed(
+                    &system_instruction::assign(contribution_pda.key, program_id),
+                    &[contribution_pda.clone(), system_program.clone()],
+                    &[seeds],
+                )?;
+            }
 
             let contribution = Contribution { amount };
             contribution.serialize(&mut &mut contribution_pda.data.borrow_mut()[..])?;
@@ -165,7 +210,6 @@ impl Processor {
             contribution.serialize(&mut &mut contribution_pda.data.borrow_mut()[..])?;
         }
 
-        let mut campaign = Campaign::try_from_slice(&campaign_account.data.borrow())?;
         campaign.raised = campaign
             .raised
             .checked_add(amount)
@@ -185,6 +229,14 @@ impl Processor {
 
         if !creator.is_signer {
             return Err(ProgramError::MissingRequiredSignature);
+        }
+
+        if system_program.key != &system_program::id() {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        if campaign_account.owner != program_id {
+            return Err(ProgramError::IncorrectProgramId);
         }
 
         let mut campaign = Campaign::try_from_slice(&campaign_account.data.borrow())?;
@@ -239,6 +291,14 @@ impl Processor {
             return Err(ProgramError::MissingRequiredSignature);
         }
 
+        if system_program.key != &system_program::id() {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        if campaign_account.owner != program_id {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
         let campaign = Campaign::try_from_slice(&campaign_account.data.borrow())?;
 
         let clock = Clock::get()?;
@@ -262,6 +322,10 @@ impl Processor {
             return Err(ProgramError::InvalidAccountData);
         }
 
+        if contribution_pda.owner != program_id {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
         if contribution_pda.data_is_empty() {
             return Err(CrowdfundingError::NoContribution.into());
         }
@@ -279,8 +343,17 @@ impl Processor {
             return Err(CrowdfundingError::InvalidVault.into());
         }
 
+        let vault_balance = vault_pda.lamports();
+        let rent_min = Rent::get()?.minimum_balance(0);
+        let remaining = vault_balance.saturating_sub(refund_amount);
+        let transfer_amount = if remaining > 0 && remaining < rent_min {
+            vault_balance
+        } else {
+            refund_amount
+        };
+
         invoke_signed(
-            &system_instruction::transfer(vault_pda.key, contributor.key, refund_amount),
+            &system_instruction::transfer(vault_pda.key, contributor.key, transfer_amount),
             &[vault_pda.clone(), contributor.clone(), system_program.clone()],
             &[&[b"vault", campaign_account.key.as_ref(), &[vault_bump]]],
         )?;
@@ -293,7 +366,7 @@ impl Processor {
             .ok_or(ProgramError::ArithmeticOverflow)?;
         contribution_pda.data.borrow_mut().fill(0);
 
-        msg!("Refunded: {} lamports", refund_amount);
+        msg!("Refunded: {} lamports", transfer_amount);
         Ok(())
     }
 }

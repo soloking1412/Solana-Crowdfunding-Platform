@@ -19,6 +19,8 @@ pub enum CrowdfundingError {
     InvalidVault,
     #[error("No contribution record found for this contributor")]
     NoContribution,
+    #[error("Campaign deadline has passed; contributions no longer accepted")]
+    CampaignEnded,
 }
 
 impl From<CrowdfundingError> for ProgramError {
