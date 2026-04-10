@@ -8,17 +8,19 @@ pub struct Campaign {
     pub raised: u64,
     pub deadline: i64,
     pub claimed: bool,
+    pub vault_bump: u8,
 }
 
 impl Campaign {
-    pub const LEN: usize = 32 + 8 + 8 + 8 + 1;
+    pub const LEN: usize = 32 + 8 + 8 + 8 + 1 + 1;
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Debug)]
 pub struct Contribution {
     pub amount: u64,
+    pub bump: u8,
 }
 
 impl Contribution {
-    pub const LEN: usize = 8;
+    pub const LEN: usize = 8 + 1;
 }

@@ -49,39 +49,45 @@ impl Processor {
         let creator = next_account_info(iter)?;
         let campaign_account = next_account_info(iter)?;
         let vault_pda = next_account_info(iter)?;
-        let system_program = next_account_info(iter)?;
+        let system_program_ai = next_account_info(iter)?;
 
         if !creator.is_signer {
             return Err(ProgramError::MissingRequiredSignature);
         }
-
-        if system_program.key != &system_program::id() {
-            return Err(ProgramError::IncorrectProgramId);
-        }
+        require_writable(creator)?;
+        require_writable(campaign_account)?;
+        require_writable(vault_pda)?;
+        require_system_program(system_program_ai)?;
 
         let clock = Clock::get()?;
         if deadline <= clock.unix_timestamp {
             return Err(CrowdfundingError::InvalidDeadline.into());
         }
 
-        let (expected_vault, _bump) =
+        let (expected_vault, vault_bump) =
             Pubkey::find_program_address(&[b"vault", campaign_account.key.as_ref()], program_id);
         if expected_vault != *vault_pda.key {
             return Err(CrowdfundingError::InvalidVault.into());
         }
 
         let rent = Rent::get()?;
-        let lamports = rent.minimum_balance(Campaign::LEN);
+        let campaign_lamports = rent.minimum_balance(Campaign::LEN);
+        let vault_rent = rent.minimum_balance(0);
 
         invoke(
             &system_instruction::create_account(
                 creator.key,
                 campaign_account.key,
-                lamports,
+                campaign_lamports,
                 Campaign::LEN as u64,
                 program_id,
             ),
-            &[creator.clone(), campaign_account.clone(), system_program.clone()],
+            &[creator.clone(), campaign_account.clone(), system_program_ai.clone()],
+        )?;
+
+        invoke(
+            &system_instruction::transfer(creator.key, vault_pda.key, vault_rent),
+            &[creator.clone(), vault_pda.clone(), system_program_ai.clone()],
         )?;
 
         let campaign = Campaign {
@@ -90,6 +96,7 @@ impl Processor {
             raised: 0,
             deadline,
             claimed: false,
+            vault_bump,
         };
         campaign.serialize(&mut &mut campaign_account.data.borrow_mut()[..])?;
 
@@ -107,39 +114,28 @@ impl Processor {
         let campaign_account = next_account_info(iter)?;
         let vault_pda = next_account_info(iter)?;
         let contribution_pda = next_account_info(iter)?;
-        let system_program = next_account_info(iter)?;
+        let system_program_ai = next_account_info(iter)?;
 
         if !contributor.is_signer {
             return Err(ProgramError::MissingRequiredSignature);
         }
+        require_writable(contributor)?;
+        require_writable(campaign_account)?;
+        require_writable(vault_pda)?;
+        require_writable(contribution_pda)?;
+        require_system_program(system_program_ai)?;
+        require_owned_by(campaign_account, program_id)?;
 
-        if system_program.key != &system_program::id() {
-            return Err(ProgramError::IncorrectProgramId);
-        }
+        let mut campaign = Campaign::try_from_slice(&campaign_account.data.borrow())?;
 
-        if campaign_account.owner != program_id {
-            return Err(ProgramError::IncorrectProgramId);
-        }
-
-        let (expected_vault, _vault_bump) =
-            Pubkey::find_program_address(&[b"vault", campaign_account.key.as_ref()], program_id);
+        let expected_vault = Pubkey::create_program_address(
+            &[b"vault", campaign_account.key.as_ref(), &[campaign.vault_bump]],
+            program_id,
+        )
+        .map_err(|_| CrowdfundingError::InvalidVault)?;
         if expected_vault != *vault_pda.key {
             return Err(CrowdfundingError::InvalidVault.into());
         }
-
-        let (expected_contribution, contribution_bump) = Pubkey::find_program_address(
-            &[
-                b"contribution",
-                campaign_account.key.as_ref(),
-                contributor.key.as_ref(),
-            ],
-            program_id,
-        );
-        if expected_contribution != *contribution_pda.key {
-            return Err(ProgramError::InvalidAccountData);
-        }
-
-        let mut campaign = Campaign::try_from_slice(&campaign_account.data.borrow())?;
 
         let clock = Clock::get()?;
         if clock.unix_timestamp >= campaign.deadline {
@@ -148,17 +144,29 @@ impl Processor {
 
         invoke(
             &system_instruction::transfer(contributor.key, vault_pda.key, amount),
-            &[contributor.clone(), vault_pda.clone(), system_program.clone()],
+            &[contributor.clone(), vault_pda.clone(), system_program_ai.clone()],
         )?;
 
-        let seeds: &[&[u8]] = &[
-            b"contribution",
-            campaign_account.key.as_ref(),
-            contributor.key.as_ref(),
-            &[contribution_bump],
-        ];
-
         if contribution_pda.data_is_empty() {
+            let (expected_contribution, contribution_bump) = Pubkey::find_program_address(
+                &[
+                    b"contribution",
+                    campaign_account.key.as_ref(),
+                    contributor.key.as_ref(),
+                ],
+                program_id,
+            );
+            if expected_contribution != *contribution_pda.key {
+                return Err(ProgramError::InvalidAccountData);
+            }
+
+            let seeds: &[&[u8]] = &[
+                b"contribution",
+                campaign_account.key.as_ref(),
+                contributor.key.as_ref(),
+                &[contribution_bump],
+            ];
+
             let rent = Rent::get()?;
             let required_lamports = rent.minimum_balance(Contribution::LEN);
             let existing_lamports = contribution_pda.lamports();
@@ -172,7 +180,7 @@ impl Processor {
                         Contribution::LEN as u64,
                         program_id,
                     ),
-                    &[contributor.clone(), contribution_pda.clone(), system_program.clone()],
+                    &[contributor.clone(), contribution_pda.clone(), system_program_ai.clone()],
                     &[seeds],
                 )?;
             } else {
@@ -183,26 +191,42 @@ impl Processor {
                             contribution_pda.key,
                             required_lamports - existing_lamports,
                         ),
-                        &[contributor.clone(), contribution_pda.clone(), system_program.clone()],
+                        &[contributor.clone(), contribution_pda.clone(), system_program_ai.clone()],
                     )?;
                 }
                 invoke_signed(
                     &system_instruction::allocate(contribution_pda.key, Contribution::LEN as u64),
-                    &[contribution_pda.clone(), system_program.clone()],
+                    &[contribution_pda.clone(), system_program_ai.clone()],
                     &[seeds],
                 )?;
                 invoke_signed(
                     &system_instruction::assign(contribution_pda.key, program_id),
-                    &[contribution_pda.clone(), system_program.clone()],
+                    &[contribution_pda.clone(), system_program_ai.clone()],
                     &[seeds],
                 )?;
             }
 
-            let contribution = Contribution { amount };
+            let contribution = Contribution { amount, bump: contribution_bump };
             contribution.serialize(&mut &mut contribution_pda.data.borrow_mut()[..])?;
         } else {
+            require_owned_by(contribution_pda, program_id)?;
             let mut contribution =
                 Contribution::try_from_slice(&contribution_pda.data.borrow())?;
+
+            let expected_contribution = Pubkey::create_program_address(
+                &[
+                    b"contribution",
+                    campaign_account.key.as_ref(),
+                    contributor.key.as_ref(),
+                    &[contribution.bump],
+                ],
+                program_id,
+            )
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+            if expected_contribution != *contribution_pda.key {
+                return Err(ProgramError::InvalidAccountData);
+            }
+
             contribution.amount = contribution
                 .amount
                 .checked_add(amount)
@@ -225,19 +249,16 @@ impl Processor {
         let creator = next_account_info(iter)?;
         let campaign_account = next_account_info(iter)?;
         let vault_pda = next_account_info(iter)?;
-        let system_program = next_account_info(iter)?;
+        let system_program_ai = next_account_info(iter)?;
 
         if !creator.is_signer {
             return Err(ProgramError::MissingRequiredSignature);
         }
-
-        if system_program.key != &system_program::id() {
-            return Err(ProgramError::IncorrectProgramId);
-        }
-
-        if campaign_account.owner != program_id {
-            return Err(ProgramError::IncorrectProgramId);
-        }
+        require_writable(creator)?;
+        require_writable(campaign_account)?;
+        require_writable(vault_pda)?;
+        require_system_program(system_program_ai)?;
+        require_owned_by(campaign_account, program_id)?;
 
         let mut campaign = Campaign::try_from_slice(&campaign_account.data.borrow())?;
 
@@ -258,8 +279,11 @@ impl Processor {
             return Err(CrowdfundingError::AlreadyClaimed.into());
         }
 
-        let (expected_vault, vault_bump) =
-            Pubkey::find_program_address(&[b"vault", campaign_account.key.as_ref()], program_id);
+        let expected_vault = Pubkey::create_program_address(
+            &[b"vault", campaign_account.key.as_ref(), &[campaign.vault_bump]],
+            program_id,
+        )
+        .map_err(|_| CrowdfundingError::InvalidVault)?;
         if expected_vault != *vault_pda.key {
             return Err(CrowdfundingError::InvalidVault.into());
         }
@@ -268,8 +292,8 @@ impl Processor {
 
         invoke_signed(
             &system_instruction::transfer(vault_pda.key, creator.key, vault_balance),
-            &[vault_pda.clone(), creator.clone(), system_program.clone()],
-            &[&[b"vault", campaign_account.key.as_ref(), &[vault_bump]]],
+            &[vault_pda.clone(), creator.clone(), system_program_ai.clone()],
+            &[&[b"vault", campaign_account.key.as_ref(), &[campaign.vault_bump]]],
         )?;
 
         campaign.claimed = true;
@@ -285,19 +309,17 @@ impl Processor {
         let campaign_account = next_account_info(iter)?;
         let vault_pda = next_account_info(iter)?;
         let contribution_pda = next_account_info(iter)?;
-        let system_program = next_account_info(iter)?;
+        let system_program_ai = next_account_info(iter)?;
 
         if !contributor.is_signer {
             return Err(ProgramError::MissingRequiredSignature);
         }
-
-        if system_program.key != &system_program::id() {
-            return Err(ProgramError::IncorrectProgramId);
-        }
-
-        if campaign_account.owner != program_id {
-            return Err(ProgramError::IncorrectProgramId);
-        }
+        require_writable(contributor)?;
+        require_writable(vault_pda)?;
+        require_writable(contribution_pda)?;
+        require_system_program(system_program_ai)?;
+        require_owned_by(campaign_account, program_id)?;
+        require_owned_by(contribution_pda, program_id)?;
 
         let campaign = Campaign::try_from_slice(&campaign_account.data.borrow())?;
 
@@ -308,22 +330,6 @@ impl Processor {
 
         if campaign.raised >= campaign.goal {
             return Err(CrowdfundingError::GoalReached.into());
-        }
-
-        let (expected_contribution, _contribution_bump) = Pubkey::find_program_address(
-            &[
-                b"contribution",
-                campaign_account.key.as_ref(),
-                contributor.key.as_ref(),
-            ],
-            program_id,
-        );
-        if expected_contribution != *contribution_pda.key {
-            return Err(ProgramError::InvalidAccountData);
-        }
-
-        if contribution_pda.owner != program_id {
-            return Err(ProgramError::IncorrectProgramId);
         }
 
         if contribution_pda.data_is_empty() {
@@ -337,25 +343,33 @@ impl Processor {
             return Err(CrowdfundingError::NoContribution.into());
         }
 
-        let (expected_vault, vault_bump) =
-            Pubkey::find_program_address(&[b"vault", campaign_account.key.as_ref()], program_id);
+        let expected_contribution = Pubkey::create_program_address(
+            &[
+                b"contribution",
+                campaign_account.key.as_ref(),
+                contributor.key.as_ref(),
+                &[contribution.bump],
+            ],
+            program_id,
+        )
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+        if expected_contribution != *contribution_pda.key {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let expected_vault = Pubkey::create_program_address(
+            &[b"vault", campaign_account.key.as_ref(), &[campaign.vault_bump]],
+            program_id,
+        )
+        .map_err(|_| CrowdfundingError::InvalidVault)?;
         if expected_vault != *vault_pda.key {
             return Err(CrowdfundingError::InvalidVault.into());
         }
 
-        let vault_balance = vault_pda.lamports();
-        let rent_min = Rent::get()?.minimum_balance(0);
-        let remaining = vault_balance.saturating_sub(refund_amount);
-        let transfer_amount = if remaining > 0 && remaining < rent_min {
-            vault_balance
-        } else {
-            refund_amount
-        };
-
         invoke_signed(
-            &system_instruction::transfer(vault_pda.key, contributor.key, transfer_amount),
-            &[vault_pda.clone(), contributor.clone(), system_program.clone()],
-            &[&[b"vault", campaign_account.key.as_ref(), &[vault_bump]]],
+            &system_instruction::transfer(vault_pda.key, contributor.key, refund_amount),
+            &[vault_pda.clone(), contributor.clone(), system_program_ai.clone()],
+            &[&[b"vault", campaign_account.key.as_ref(), &[campaign.vault_bump]]],
         )?;
 
         let contribution_lamports = contribution_pda.lamports();
@@ -366,7 +380,28 @@ impl Processor {
             .ok_or(ProgramError::ArithmeticOverflow)?;
         contribution_pda.data.borrow_mut().fill(0);
 
-        msg!("Refunded: {} lamports", transfer_amount);
+        msg!("Refunded: {} lamports", refund_amount);
         Ok(())
     }
+}
+
+fn require_writable(account: &AccountInfo) -> ProgramResult {
+    if !account.is_writable {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
+fn require_system_program(account: &AccountInfo) -> ProgramResult {
+    if account.key != &system_program::id() {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    Ok(())
+}
+
+fn require_owned_by(account: &AccountInfo, owner: &Pubkey) -> ProgramResult {
+    if account.owner != owner {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    Ok(())
 }
